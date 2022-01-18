@@ -19,6 +19,11 @@ Resources:
     Properties:
       BucketName: !Ref BucketName
       AccessControl: "Private"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
   #----------S3 Bucket Policy--------------------#
   BucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -27,14 +32,147 @@ Resources:
       PolicyDocument:
         Version: 2012-10-17
         Statement:
-          - Action: ['s3:GetObject', 's3:PutObject', 's3:ListBucket']
+          - Action: ['s3:GetObject', 's3:PutObject']
             Effect: Allow
             Resource: !Join [ "", [ !GetAtt S3Bucket.Arn, "/*"  ] ]
             Principal:
-              AWS:
-                - !GetAtt RoleIpSetFetcher.Arn
+              AWS: [ !GetAtt RoleIpSetFetcher.Arn, !GetAtt RoleS3PutObject.Arn]
               Service:
                 - 'guardduty.amazonaws.com'
+          - Action: ['s3:ListBucket']
+            Effect: Allow
+            Resource: !Join [ "", [ !GetAtt S3Bucket.Arn ] ]
+            Principal:
+              AWS: [ !GetAtt RoleIpSetFetcher.Arn, !GetAtt RoleS3PutObject.Arn]
+              Service:
+                - 'guardduty.amazonaws.com'
+  #-------- IAM policy to put logs into CloudWatch --------#
+  PolicyCloudWatchPutLogs:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: 'CloudWatchPutLogs'
+      PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [
+                  "logs:PutLogEvents",
+                  "logs:CreateLogGroup",
+                  "logs:CreateLogStream"
+              ]
+              Resource: "arn:aws:logs:*:*:*"
+      Roles:
+        - !Ref RoleS3PutObject
+        - !Ref RoleTriggerMyLambda
+        - !Ref RoleIpSetFetcher
+  #-------- Role S3 put object --------#
+  RoleS3PutObject:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref BucketName, 'PutObject'] ]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: "sts:AssumeRole"
+            Principal:
+              Service:  ["lambda.amazonaws.com"]
+      Policies:
+        - PolicyName: !Join ['', [!Ref BucketName, 'PutObject', 'Access']]
+          PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: ['s3:PutObject']
+                  Resource: !Join [ '',['arn:aws:s3:::', !Ref BucketName, '/*']]
+  #-------- Lambda to put an object into S3 Bucket --------#
+  LambdaS3PutObject:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Function to put an S3 object
+      Environment:
+        Variables:
+          BucketName: !Ref BucketName
+          ObjectName: !Ref ObjectName
+      FunctionName: !Join ['', [!Ref BucketName, 'PutObject']]
+      Handler: index.handler
+      PackageType: Zip
+      Role: !GetAtt RoleS3PutObject.Arn
+      Runtime: "python3.6"
+      Timeout: 60
+      Code:
+        ZipFile: |
+            import boto3
+            import os
+
+            BucketName = os.environ['BucketName']
+            ObjectName = os.environ['ObjectName']
+
+            def handler(event, context):
+              try:
+                s3 = boto3.resource('s3')
+                bucket = s3.Bucket(BucketName)
+                os.popen("echo '' >>  /tmp/ip_list.txt")
+                bucket.upload_file('/tmp/ip_list.txt', ObjectName)
+              except:
+                  print("Error accessing S3 Bucket")
+  #-------- Role for Custom resource backed Lambda --------#
+  RoleTriggerMyLambda:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: TriggerMyLambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: "sts:AssumeRole"
+            Principal:
+              Service:  ["lambda.amazonaws.com"]
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaRole'
+  #-------- Custom resource backed Lambda that invokes another Lamda --------#
+  CFHelperLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Function to put an S3 object
+      Environment:
+        Variables:
+          # LambdaToTrigger: !Join['', !Ref BucketName, 'PutObject']
+          LambdaToTrigger: !Ref LambdaS3PutObject
+      FunctionName: CFHelperLambda
+      Handler: index.handler
+      PackageType: Zip
+      Role: !GetAtt RoleTriggerMyLambda.Arn
+      Runtime: "python3.9"
+      Timeout: 60
+      Code:
+        ZipFile: |
+            import boto3, os
+            import json
+            import cfnresponse
+            import logging
+
+            LambdaToTrigger = os.environ['LambdaToTrigger']
+
+            def handler(event, context):
+                lambda_client = boto3.client('lambda')
+                test_event = '{"type":"dummy"}'
+                lambda_client.invoke(
+                    FunctionName=LambdaToTrigger,
+                    InvocationType='Event',
+                    Payload=test_event,
+                )
+                responseValue = 200
+                responseData = {}
+                responseData['ReturnCode'] = responseValue
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+  #-------- Custom Resource to trigger object creation in S3 --------#
+  CustomResourcePutS3Object:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: 'CFHelperLambda'
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt CFHelperLambda.Arn
   #----------EventBridge - CRON Rule --------------------#
   ScheduledRule:
     Type: AWS::Events::Rule
@@ -44,7 +182,7 @@ Resources:
       # ScheduleExpression: "cron(? ? 1 * ? 2022-2023)" # Day1 of every month
       State: "ENABLED"
       Targets:  [{Arn: !GetAtt ["IpSetFetcher", "Arn"], Id: "TargetFunction" } ]
-  #----------CRON Rule EventBridge--------------------#
+  #----------Lambda Permission to be invoked by EventBridge--------------------#
   PermissionForEventsToInvokeLambda:
     Type: AWS::Lambda::Permission
     Properties:
@@ -52,7 +190,7 @@ Resources:
       Action: "lambda:InvokeFunction"
       Principal: "events.amazonaws.com"
       SourceArn:  !GetAtt ["ScheduledRule", "Arn"]
-  #----------Lamba Exec Role--------------------#
+  #----------Lamba Exec Role for IpSetFetcher--------------------#
   RoleIpSetFetcher:
     Type: AWS::IAM::Role
     Properties:
@@ -75,87 +213,62 @@ Resources:
                 - Effect: Allow
                   Action: ['s3:GetObject', 's3:PutObject', 's3:ListBucket']
                   Resource: !GetAtt S3Bucket.Arn
-        - PolicyName: CloudwatchAccess
-          PolicyDocument:
-              Version: '2012-10-17'
-              Statement:
-                - Effect: Allow
-                  Action: [
-                      "logs:PutLogEvents",
-                      "logs:CreateLogGroup",
-                      "logs:CreateLogStream"
-                  ]
-                  Resource: "arn:aws:logs:*:*:*"
-  #----------Lamba function--------------------#
+  #----------Lamba to fetch malicious IP set from AbuseIpDB--------------------#
   IpSetFetcher:
     Type: AWS::Lambda::Function
     Properties:
       Description: Function to fetch malicious IP set from AbuseIpDB
       Environment:
         Variables:
-          Apikey: !Ref ApiKeyAbuseIpDB
+          ApiKey: !Ref ApiKeyAbuseIpDB
           BucketName: !Ref BucketName
           ObjectName: !Ref ObjectName
       FunctionName: UpdateBlockIpSet
-      Handler: index.lambda_handler
-      # KmsKeyArn: String
+      Handler: index.handler
       PackageType: Zip
       Role: !GetAtt RoleIpSetFetcher.Arn
-      Runtime: "python3.9"
+      Runtime: "python3.6"
       Timeout: 60
       Code:
         ZipFile: |
             import boto3
             import os
-            import logging
-            from botocore.exceptions import ClientError
 
             BucketName = os.environ['BucketName']
             ObjectName = os.environ['ObjectName']
-            KeyId = os.environ['KeyId']
+            KeyId = os.environ['ApiKey']
 
-            # ToDo : Pass KeyId as parameter to popen()
-
-            def lambda_handler(event, context):
+            def handler(event, context):
               s3 = boto3.resource('s3')
               try:
                   bucket = s3.Bucket(BucketName)
                   if ObjectName in bucket.objects.all():
                     bucket.download_file(ObjectName, '/tmp/ip_list.txt')
-                  os.popen("curl -G https://api.abuseipdb.com/api/v2/blacklist  \
-                              -d confidenceMinimum=90 \
-                              -H "Key: <KeyId goes here>"  \
-                              -H "Accept: text/plain" -o /tmp/ip_list.txt")
-                  bucket.upload_file('/tmp/ip_list.txt', ObjectName)
-              except ClientError as e:
-                  logging.error(e)
-
-  # #----------GuardDuty Detector--------------------#
-  # Detector:
-  #   Type: AWS::GuardDuty::Detector
-  #   Properties:
-  #       Enable: True
-  #       FindingPublishingFrequency: FIFTEEN_MINUTES
-  # #----------GuardDuty ThreatIntelSet--------------------#
-  # ThreatIntelIpSet:
-  #   Type: AWS::GuardDuty::ThreatIntelSet
-  #   Properties:
-  #       Activate: true
-  #       DetectorId: !Ref Detector
-  #       Format: "TXT"
-  #       Location: !Join ['',
-  #                   ['https://', !GetAtt S3Bucket.DomainName, '/', !Ref ObjectName]
-  #                 ]
-  #       Name: "MyThreatIntelSet"
-  # DetectorFindingsFilter:
-  # To be used if some findings are to be whitelisted as NOOPs
-  #   https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-guardduty-filter.html
-  #   Type: AWS::GuardDuty::Filter
-  #   Properties:
-        # Action: Allowed values: ARCHIVE | NOOP
-        # Description: String
-        # DetectorId: String
-        # FindingCriteria:
-        #   FindingCriteria
-        # Name: String
-        # Rank: Integer
+                  cmd = 'curl -s -G https://api.abuseipdb.com/api/v2/blacklist' + \
+                        ' -d confidenceMinimum=90' + \
+                        ' -H \"Key:' + \
+                        KeyId + '\"' + \
+                        ' -H \"Accept: text/plain\" >> /tmp/ip_list.txt'
+                  os.popen(cmd)
+                  os.popen('sort /tmp/ip_list.txt | uniq >> /tmp/ip_list_no_dup.txt')
+                  bucket.upload_file('/tmp/ip_list_no_dup.txt', ObjectName)
+              except:
+                print("Ran into error while accessing S3 bucket")
+  #----------GuardDuty Detector--------------------#
+  Detector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+        Enable: True
+        FindingPublishingFrequency: FIFTEEN_MINUTES
+  #----------GuardDuty ThreatIntelSet--------------------#
+  ThreatIntelIpSet:
+    Type: AWS::GuardDuty::ThreatIntelSet
+    DependsOn: 'CustomResourcePutS3Object'
+    Properties:
+        Activate: true
+        DetectorId: !Ref Detector
+        Format: "TXT"
+        Location: !Join ['',
+                    ['https://', !Ref BucketName, '.s3.amazonaws.com/', !Ref ObjectName ]
+                  ]
+        Name: "MyThreatIntelSet"
